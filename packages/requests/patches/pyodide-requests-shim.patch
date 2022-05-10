@@ -1,0 +1,487 @@
+diff --git a/requests/models.py b/requests/models.py
+index e7d292d5..8ab50510 100644
+--- a/requests/models.py
++++ b/requests/models.py
+@@ -8,41 +8,36 @@ This module contains the primary objects that power Requests.
+ """
+ 
+ import datetime
+-import sys
+-
+ # Import encoding now, to avoid implicit import later.
+ # Implicit import within threads may cause LookupError when standard library is in a ZIP,
+ # such as in Embedded Python. See https://github.com/psf/requests/issues/3578.
+-import encodings.idna
++from email.parser import Parser
++from io import UnsupportedOperation, BytesIO, StringIO
+ 
++from urllib3.exceptions import (
++    LocationParseError, ProtocolError, DecodeError, ReadTimeoutError)
+ from urllib3.fields import RequestField
+ from urllib3.filepost import encode_multipart_formdata
+ from urllib3.util import parse_url
+-from urllib3.exceptions import (
+-    DecodeError, ReadTimeoutError, ProtocolError, LocationParseError)
+-
+-from io import UnsupportedOperation
+-from .hooks import default_hooks
+-from .structures import CaseInsensitiveDict
+ 
+-from .auth import HTTPBasicAuth
+-from .cookies import cookiejar_from_dict, get_cookie_header, _copy_cookie_jar
+-from .exceptions import (
+-    HTTPError, MissingSchema, InvalidURL, ChunkedEncodingError,
+-    ContentDecodingError, ConnectionError, StreamConsumedError,
+-    InvalidJSONError)
+-from .exceptions import JSONDecodeError as RequestsJSONDecodeError
+ from ._internal_utils import to_native_string, unicode_is_ascii
+-from .utils import (
+-    guess_filename, get_auth_from_url, requote_uri,
+-    stream_decode_response_unicode, to_key_val_list, parse_header_links,
+-    iter_slices, guess_json_utf, super_len, check_header_validity)
++from .auth import HTTPBasicAuth
+ from .compat import (
+     Callable, Mapping,
+     cookielib, urlunparse, urlsplit, urlencode, str, bytes,
+-    is_py2, chardet, builtin_str, basestring, JSONDecodeError)
++    is_py2, chardet, builtin_str, basestring)
+ from .compat import json as complexjson
++from .cookies import cookiejar_from_dict, get_cookie_header, _copy_cookie_jar
++from .exceptions import (
++    HTTPError, MissingSchema, InvalidURL, InvalidJSONError, ContentDecodingError, ChunkedEncodingError,
++    StreamConsumedError)
++from .hooks import default_hooks
+ from .status_codes import codes
++from .structures import CaseInsensitiveDict
++from .utils import (
++    guess_filename, get_auth_from_url, requote_uri,
++    to_key_val_list, parse_header_links,
++    super_len, check_header_validity, iter_slices, stream_decode_response_unicode)
+ 
+ #: The set of HTTP status codes that indicate an automatically
+ #: processable redirect.
+@@ -603,24 +598,22 @@ class Response(object):
+         'encoding', 'reason', 'cookies', 'elapsed', 'request'
+     ]
+ 
+-    def __init__(self):
++    def __init__(self, request):
++        if request.responseIsBinary:
++            # bring everything outside the range of a single byte within this range
++            self.raw = BytesIO(bytes(ord(byte) & 0xff for byte in request.response))
++        else:
++            self.text = str(request.response)
++            self.raw = StringIO(str(request.response))
++        self.status_code = request.status
++        self.headers = CaseInsensitiveDict(Parser().parsestr(request.getAllResponseHeaders(), headersonly=True))
++        # Strip the transfer-encoding header, since Python logic relying on checking this header will have a bad time
++        if 'transfer-encoding' in self.headers:
++            del self.headers['transfer-encoding']
+         self._content = False
+         self._content_consumed = False
+         self._next = None
+ 
+-        #: Integer Code of responded HTTP Status, e.g. 404 or 200.
+-        self.status_code = None
+-
+-        #: Case-insensitive Dictionary of Response Headers.
+-        #: For example, ``headers['content-encoding']`` will return the
+-        #: value of a ``'Content-Encoding'`` response header.
+-        self.headers = CaseInsensitiveDict()
+-
+-        #: File-like object representation of response (for advanced usage).
+-        #: Use of ``raw`` requires that ``stream=True`` be set on the request.
+-        #: This requirement does not apply for use internally to Requests.
+-        self.raw = None
+-
+         #: Final URL location of Response.
+         self.url = None
+ 
+@@ -742,13 +735,11 @@ class Response(object):
+         large responses.  The chunk size is the number of bytes it should
+         read into memory.  This is not necessarily the length of each item
+         returned as decoding can take place.
+-
+         chunk_size must be of type int or None. A value of None will
+         function differently depending on the value of `stream`.
+         stream=True will read data as it arrives in whatever size the
+         chunks are received. If stream=False, data is returned as
+         a single chunk.
+-
+         If decode_unicode is True, content will be decoded using the best
+         available encoding based on the response.
+         """
+@@ -842,44 +833,6 @@ class Response(object):
+         # since we exhausted the data.
+         return self._content
+ 
+-    @property
+-    def text(self):
+-        """Content of the response, in unicode.
+-
+-        If Response.encoding is None, encoding will be guessed using
+-        ``charset_normalizer`` or ``chardet``.
+-
+-        The encoding of the response content is determined based solely on HTTP
+-        headers, following RFC 2616 to the letter. If you can take advantage of
+-        non-HTTP knowledge to make a better guess at the encoding, you should
+-        set ``r.encoding`` appropriately before accessing this property.
+-        """
+-
+-        # Try charset from content-type
+-        content = None
+-        encoding = self.encoding
+-
+-        if not self.content:
+-            return str('')
+-
+-        # Fallback to auto-detected encoding.
+-        if self.encoding is None:
+-            encoding = self.apparent_encoding
+-
+-        # Decode unicode from given encoding.
+-        try:
+-            content = str(self.content, encoding, errors='replace')
+-        except (LookupError, TypeError):
+-            # A LookupError is raised if the encoding was not found which could
+-            # indicate a misspelling or similar mistake.
+-            #
+-            # A TypeError can be raised if encoding is None
+-            #
+-            # So we try blindly encoding.
+-            content = str(self.content, errors='replace')
+-
+-        return content
+-
+     def json(self, **kwargs):
+         r"""Returns the json-encoded content of a response, if any.
+ 
+@@ -887,34 +840,7 @@ class Response(object):
+         :raises requests.exceptions.JSONDecodeError: If the response body does not
+             contain valid json.
+         """
+-
+-        if not self.encoding and self.content and len(self.content) > 3:
+-            # No encoding set. JSON RFC 4627 section 3 states we should expect
+-            # UTF-8, -16 or -32. Detect which one to use; If the detection or
+-            # decoding fails, fall back to `self.text` (using charset_normalizer to make
+-            # a best guess).
+-            encoding = guess_json_utf(self.content)
+-            if encoding is not None:
+-                try:
+-                    return complexjson.loads(
+-                        self.content.decode(encoding), **kwargs
+-                    )
+-                except UnicodeDecodeError:
+-                    # Wrong UTF codec detected; usually because it's not UTF-8
+-                    # but some other 8-bit codec.  This is an RFC violation,
+-                    # and the server didn't bother to tell us what codec *was*
+-                    # used.
+-                    pass
+-
+-        try:
+-            return complexjson.loads(self.text, **kwargs)
+-        except JSONDecodeError as e:
+-            # Catch JSON-related errors and raise as requests.JSONDecodeError
+-            # This aliases json.JSONDecodeError and simplejson.JSONDecodeError
+-            if is_py2: # e is a ValueError
+-                raise RequestsJSONDecodeError(e.message)
+-            else:
+-                raise RequestsJSONDecodeError(e.msg, e.doc, e.pos)
++        return complexjson.loads(self.text)
+ 
+     @property
+     def links(self):
+diff --git a/requests/sessions.py b/requests/sessions.py
+index ae4bcc8e..2a0c8853 100644
+--- a/requests/sessions.py
++++ b/requests/sessions.py
+@@ -7,35 +7,40 @@ requests.sessions
+ This module provides a Session object to manage and persist settings across
+ requests (cookies, auth, proxies).
+ """
++import json as json_module
+ import os
+ import sys
+ import time
++import warnings
++from collections import OrderedDict, Iterable
+ from datetime import timedelta
+-from collections import OrderedDict
++from urllib.parse import urlencode
+ 
++from js import XMLHttpRequest
++
++try:
++    from js import Blob
++except:
++    from js.buffer import Blob
++
++from ._internal_utils import to_native_string
+ from .auth import _basic_auth_str
+-from .compat import cookielib, is_py3, urljoin, urlparse, Mapping
++from .compat import is_py3, urljoin, urlparse, Mapping
+ from .cookies import (
+-    cookiejar_from_dict, extract_cookies_to_jar, RequestsCookieJar, merge_cookies)
+-from .models import Request, PreparedRequest, DEFAULT_REDIRECT_LIMIT
+-from .hooks import default_hooks, dispatch_hook
+-from ._internal_utils import to_native_string
+-from .utils import to_key_val_list, default_headers, DEFAULT_PORTS
++    extract_cookies_to_jar, merge_cookies)
+ from .exceptions import (
+     TooManyRedirects, InvalidSchema, ChunkedEncodingError, ContentDecodingError)
+-
++from .hooks import default_hooks, dispatch_hook
++from .models import Request, DEFAULT_REDIRECT_LIMIT, Response
++from .status_codes import codes
+ from .structures import CaseInsensitiveDict
+-from .adapters import HTTPAdapter
+-
+ from .utils import (
+     requote_uri, get_environ_proxies, get_netrc_auth, should_bypass_proxies,
+     get_auth_from_url, rewind_body
+ )
+-
+-from .status_codes import codes
++from .utils import to_key_val_list, DEFAULT_PORTS
+ 
+ # formerly defined here, reexposed here for backward compatibility
+-from .models import REDIRECT_STATI
+ 
+ # Preferred clock, based on which one is more accurate on a given system.
+ if sys.platform == 'win32':
+@@ -334,25 +339,14 @@ class SessionRedirectMixin(object):
+         prepared_request.method = method
+ 
+ 
+-class Session(SessionRedirectMixin):
+-    """A Requests session.
+-
+-    Provides cookie persistence, connection-pooling, and configuration.
+-
+-    Basic Usage::
+-
+-      >>> import requests
+-      >>> s = requests.Session()
+-      >>> s.get('https://httpbin.org/get')
+-      <Response [200]>
++class Session:
++    """
++    No-op context manager for packages that rely on requests.Session.
+ 
+-    Or as a context manager::
++    It has been made entirely no-op because the browser will handle cookies, headers etc., unless explicitly set by
++    the user of this requests version.
+ 
+-      >>> with requests.Session() as s:
+-      ...     s.get('https://httpbin.org/get')
+-      <Response [200]>
+     """
+-
+     __attrs__ = [
+         'headers', 'cookies', 'auth', 'proxies', 'hooks', 'params', 'verify',
+         'cert', 'adapters', 'stream', 'trust_env',
+@@ -361,111 +355,37 @@ class Session(SessionRedirectMixin):
+ 
+     def __init__(self):
+ 
+-        #: A case-insensitive dictionary of headers to be sent on each
+-        #: :class:`Request <Request>` sent from this
+-        #: :class:`Session <Session>`.
+-        self.headers = default_headers()
+-
+-        #: Default Authentication tuple or object to attach to
+-        #: :class:`Request <Request>`.
++        self.headers = CaseInsensitiveDict({})
+         self.auth = None
+-
+-        #: Dictionary mapping protocol or protocol and host to the URL of the proxy
+-        #: (e.g. {'http': 'foo.bar:3128', 'http://host.name': 'foo.bar:4012'}) to
+-        #: be used on each :class:`Request <Request>`.
+         self.proxies = {}
+-
+-        #: Event-handling hooks.
+         self.hooks = default_hooks()
+-
+-        #: Dictionary of querystring data to attach to each
+-        #: :class:`Request <Request>`. The dictionary values may be lists for
+-        #: representing multivalued query parameters.
+         self.params = {}
+-
+-        #: Stream response content default.
+         self.stream = False
+-
+-        #: SSL Verification default.
+-        #: Defaults to `True`, requiring requests to verify the TLS certificate at the
+-        #: remote end.
+-        #: If verify is set to `False`, requests will accept any TLS certificate
+-        #: presented by the server, and will ignore hostname mismatches and/or
+-        #: expired certificates, which will make your application vulnerable to
+-        #: man-in-the-middle (MitM) attacks.
+-        #: Only set this to `False` for testing.
+         self.verify = True
+-
+-        #: SSL client certificate default, if String, path to ssl client
+-        #: cert file (.pem). If Tuple, ('cert', 'key') pair.
+         self.cert = None
+-
+-        #: Maximum number of redirects allowed. If the request exceeds this
+-        #: limit, a :class:`TooManyRedirects` exception is raised.
+-        #: This defaults to requests.models.DEFAULT_REDIRECT_LIMIT, which is
+-        #: 30.
+         self.max_redirects = DEFAULT_REDIRECT_LIMIT
+-
+-        #: Trust environment settings for proxy configuration, default
+-        #: authentication and similar.
+         self.trust_env = True
+-
+-        #: A CookieJar containing all currently outstanding cookies set on this
+-        #: session. By default it is a
+-        #: :class:`RequestsCookieJar <requests.cookies.RequestsCookieJar>`, but
+-        #: may be any other ``cookielib.CookieJar`` compatible object.
+-        self.cookies = cookiejar_from_dict({})
+-
+-        # Default connection adapters.
+-        self.adapters = OrderedDict()
+-        self.mount('https://', HTTPAdapter())
+-        self.mount('http://', HTTPAdapter())
++        self.cookies = {}
++        self.adapters = {}
+ 
+     def __enter__(self):
+         return self
+ 
+     def __exit__(self, *args):
+-        self.close()
+-
+-    def prepare_request(self, request):
+-        """Constructs a :class:`PreparedRequest <PreparedRequest>` for
+-        transmission and returns it. The :class:`PreparedRequest` has settings
+-        merged from the :class:`Request <Request>` instance and those of the
+-        :class:`Session`.
+-
+-        :param request: :class:`Request` instance to prepare with this
+-            session's settings.
+-        :rtype: requests.PreparedRequest
+-        """
+-        cookies = request.cookies or {}
+-
+-        # Bootstrap CookieJar.
+-        if not isinstance(cookies, cookielib.CookieJar):
+-            cookies = cookiejar_from_dict(cookies)
+-
+-        # Merge with session cookies
+-        merged_cookies = merge_cookies(
+-            merge_cookies(RequestsCookieJar(), self.cookies), cookies)
+-
+-        # Set environment's basic authentication if not explicitly set.
+-        auth = request.auth
+-        if self.trust_env and not auth and not self.auth:
+-            auth = get_netrc_auth(request.url)
+-
+-        p = PreparedRequest()
+-        p.prepare(
+-            method=request.method.upper(),
+-            url=request.url,
+-            files=request.files,
+-            data=request.data,
+-            json=request.json,
+-            headers=merge_setting(request.headers, self.headers, dict_class=CaseInsensitiveDict),
+-            params=merge_setting(request.params, self.params),
+-            auth=merge_setting(auth, self.auth),
+-            cookies=merged_cookies,
+-            hooks=merge_hooks(request.hooks, self.hooks),
+-        )
+-        return p
++        ...
++
++    def set_headers(self, request, headers):
++        for header, value in self.headers.items():
++            request.setRequestHeader(header, value)
++        if isinstance(headers, Mapping):
++            for header, value in headers.items():
++                request.setRequestHeader(header, value)
++            return CaseInsensitiveDict(headers)
++        if isinstance(headers, Iterable):
++            for header, value in headers:
++                request.setRequestHeader(header, value)
++            return CaseInsensitiveDict(headers)
++        return CaseInsensitiveDict({})
+ 
+     def request(self, method, url,
+             params=None, data=None, headers=None, cookies=None, files=None,
+@@ -512,36 +432,44 @@ class Session(SessionRedirectMixin):
+             If Tuple, ('cert', 'key') pair.
+         :rtype: requests.Response
+         """
+-        # Create the Request.
+-        req = Request(
+-            method=method.upper(),
+-            url=url,
+-            headers=headers,
+-            files=files,
+-            data=data or {},
+-            json=json,
+-            params=params or {},
+-            auth=auth,
+-            cookies=cookies,
+-            hooks=hooks,
+-        )
+-        prep = self.prepare_request(req)
+-
+-        proxies = proxies or {}
+-
+-        settings = self.merge_environment_settings(
+-            prep.url, proxies, stream, verify, cert
+-        )
+-
+-        # Send the request.
+-        send_kwargs = {
+-            'timeout': timeout,
+-            'allow_redirects': allow_redirects,
+-        }
+-        send_kwargs.update(settings)
+-        resp = self.send(prep, **send_kwargs)
+-
+-        return resp
++        request = XMLHttpRequest.new()
++        request.responseIsBinary = False
++        if stream:
++            # we ask the browser not to worry about the character set, keeping the raw bytes intact
++            request.overrideMimeType('text/plain; charset=x-user-defined')
++            request.responseIsBinary = True
++        # Send cookies that might be set in the browser already
++        request.withCredentials = True
++        request.open(method.upper(), url, False)
++        if params:
++            if isinstance(params, Mapping):
++                url = url + '?' + urlencode(params)
++        headers = self.set_headers(request, headers)
++        if ('range' in headers) or ('accept' in headers and 'application/octet-stream' in headers['accept']):
++            request.overrideMimeType('text/plain; charset=x-user-defined')
++            request.responseIsBinary = True
++        if data:
++            if isinstance(data, Mapping):
++                data = Blob.new([json_module.dumps(data)], {
++                    'type': 'application/json',
++                })
++            else:
++                warnings.warn('This type of input to the data parameter of Pyodide requests is not (yet) supported')
++        if json:
++            if isinstance(json, Mapping):
++                data = Blob.new([json_module.dumps(json)], {
++                    'type': 'application/json',
++                })
++            else:
++                warnings.warn('This type of input to the json parameter of Pyodide requests is not (yet) supported')
++        if verify is not None or cert or not allow_redirects or proxies or auth or hooks or files or cookies:
++            warnings.warn('The Pyodide version of requests does not support the following parameters (yet): '
++                          'verify, cert, allow_redirects, proxies, auth, hooks, files and cookies')
++        if data:
++            request.send(data)
++        else:
++            request.send()
++        return Response(request)
+ 
+     def get(self, url, **kwargs):
+         r"""Sends a GET request. Returns :class:`Response` object.
